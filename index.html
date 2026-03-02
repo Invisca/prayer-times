@@ -1,45 +1,218 @@
 <!DOCTYPE html>
 <html>
 <head>
-<title>Prayer Times</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Prayer Times</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
 
-<style>
-body {
-    font-family: Arial;
-    background:#0f172a;
-    color:white;
-    text-align:center;
-    padding:30px;
-}
+  <style>
+    body {
+      font-family: Arial;
+      background:#0f172a;
+      color:white;
+      text-align:center;
+      padding:30px;
+    }
 
-.container {
-    max-width:400px;
-    margin:auto;
-}
+    .container {
+      max-width:400px;
+      margin:auto;
+    }
 
-.prayer {
-    display:flex;
-    justify-content:space-between;
-    padding:12px;
-    border-bottom:1px solid #334155;
-}
-</style>
+    .prayer {
+      display:flex;
+      justify-content:space-between;
+      padding:12px;
+      border-bottom:1px solid #334155;
+      font-size: 18px;
+    }
+
+    .muted {
+      margin-top: 14px;
+      color:#94a3b8;
+      font-size: 14px;
+    }
+
+    .error {
+      margin-top: 14px;
+      color:#fca5a5;
+      font-size: 14px;
+      display:none;
+    }
+  </style>
 </head>
 
 <body>
+  <div class="container">
+    <h2 id="title">Prayer Times</h2>
 
-<div class="container">
+    <div class="prayer"><span>Fajr</span><span id="t-fajr">--:--</span></div>
+    <div class="prayer"><span>Dhuhr</span><span id="t-dhuhr">--:--</span></div>
+    <div class="prayer"><span>Asr</span><span id="t-asr">--:--</span></div>
+    <div class="prayer"><span>Maghrib</span><span id="t-maghrib">--:--</span></div>
+    <div class="prayer"><span>Isha</span><span id="t-isha">--:--</span></div>
 
-<h2>Prayer Times</h2>
+    <div class="muted" id="updated">Last Updated: --</div>
+    <div class="error" id="err"></div>
+  </div>
 
-<div class="prayer"><span>Fajr</span><span>--:--</span></div>
-<div class="prayer"><span>Dhuhr</span><span>--:--</span></div>
-<div class="prayer"><span>Asr</span><span>--:--</span></div>
-<div class="prayer"><span>Maghrib</span><span>--:--</span></div>
-<div class="prayer"><span>Isha</span><span>--:--</span></div>
+  <script>
+    // ---------- Config ----------
+    // Calculation method reference (AlAdhan API):
+    // 2 = ISNA, 3 = MWL, 5 = Egypt, 4 = Umm al-Qura, 1 = Karachi
+    const CALC_METHOD = 2; // change if you want
+    const CACHE_KEY = "prayerTimesCacheV1";
+    const CACHE_MAX_AGE_MS = 18 * 60 * 60 * 1000; // 18 hours
 
-</div>
+    // ---------- Helpers ----------
+    function $(id) { return document.getElementById(id); }
 
+    function fmtTimeFromHHMM(hhmm) {
+      // Input like "05:12" or "05:12 (EST)" -> keep first 5 chars
+      const clean = hhmm.slice(0,5);
+      const [hStr, mStr] = clean.split(":");
+      let h = parseInt(hStr, 10);
+      const m = parseInt(mStr, 10);
+      const ampm = h >= 12 ? "PM" : "AM";
+      h = h % 12;
+      if (h === 0) h = 12;
+      return `${h}:${m.toString().padStart(2,"0")} ${ampm}`;
+    }
+
+    function setTimes(t) {
+      $("t-fajr").textContent    = fmtTimeFromHHMM(t.Fajr);
+      $("t-dhuhr").textContent   = fmtTimeFromHHMM(t.Dhuhr);
+      $("t-asr").textContent     = fmtTimeFromHHMM(t.Asr);
+      $("t-maghrib").textContent = fmtTimeFromHHMM(t.Maghrib);
+      $("t-isha").textContent    = fmtTimeFromHHMM(t.Isha);
+    }
+
+    function setUpdated(dateIso, note="") {
+      const d = new Date(dateIso);
+      const time = d.toLocaleTimeString([], {hour:"numeric", minute:"2-digit"});
+      $("updated").textContent = `Last Updated: ${time}${note ? " ("+note+")" : ""}`;
+    }
+
+    function showError(msg) {
+      const el = $("err");
+      el.textContent = msg;
+      el.style.display = "block";
+    }
+
+    // ---------- Cache ----------
+    function loadCache() {
+      try {
+        const raw = localStorage.getItem(CACHE_KEY);
+        if (!raw) return null;
+        const obj = JSON.parse(raw);
+        if (!obj || !obj.updatedAt || !obj.timings) return null;
+        return obj;
+      } catch {
+        return null;
+      }
+    }
+
+    function saveCache(obj) {
+      try { localStorage.setItem(CACHE_KEY, JSON.stringify(obj)); } catch {}
+    }
+
+    function cacheIsFresh(cache) {
+      const age = Date.now() - new Date(cache.updatedAt).getTime();
+      return age >= 0 && age < CACHE_MAX_AGE_MS;
+    }
+
+    // ---------- Location + Fetch ----------
+    function getLocation() {
+      return new Promise((resolve, reject) => {
+        if (!navigator.geolocation) {
+          reject(new Error("Geolocation not supported."));
+          return;
+        }
+        navigator.geolocation.getCurrentPosition(
+          (pos) => resolve({
+            lat: pos.coords.latitude,
+            lon: pos.coords.longitude
+          }),
+          (err) => reject(err),
+          { enableHighAccuracy: false, timeout: 8000, maximumAge: 60 * 60 * 1000 }
+        );
+      });
+    }
+
+    async function fetchPrayerTimes(lat, lon) {
+      // Use today's date in DD-MM-YYYY for the AlAdhan "timings" endpoint
+      const now = new Date();
+      const dd = String(now.getDate()).padStart(2,"0");
+      const mm = String(now.getMonth()+1).padStart(2,"0");
+      const yyyy = now.getFullYear();
+
+      const url = `https://api.aladhan.com/v1/timings/${dd}-${mm}-${yyyy}?latitude=${lat}&longitude=${lon}&method=${CALC_METHOD}`;
+
+      const res = await fetch(url, { cache: "no-store" });
+      if (!res.ok) throw new Error(`API error: ${res.status}`);
+      const json = await res.json();
+      if (!json || json.code !== 200) throw new Error("Bad API response.");
+
+      // timings include many fields; we only keep the 5
+      const timings = json.data.timings;
+      return {
+        timings: {
+          Fajr: timings.Fajr,
+          Dhuhr: timings.Dhuhr,
+          Asr: timings.Asr,
+          Maghrib: timings.Maghrib,
+          Isha: timings.Isha
+        },
+        meta: json.data.meta
+      };
+    }
+
+    async function main() {
+      // 1) Load and display cache immediately (fast UI)
+      const cache = loadCache();
+      if (cache && cache.timings) {
+        setTimes(cache.timings);
+        setUpdated(cache.updatedAt, cacheIsFresh(cache) ? "cached" : "stale");
+      }
+
+      // 2) If cache is fresh, stop here (saves data)
+      if (cache && cacheIsFresh(cache)) return;
+
+      // 3) Otherwise fetch new data
+      try {
+        $("err").style.display = "none";
+        $("updated").textContent = "Last Updated: Fetching...";
+
+        const { lat, lon } = await getLocation();
+        const data = await fetchPrayerTimes(lat, lon);
+
+        setTimes(data.timings);
+
+        const updatedAt = new Date().toISOString();
+        setUpdated(updatedAt, "live");
+
+        // Show a tiny location hint in the title (optional)
+        const tz = data.meta && data.meta.timezone ? data.meta.timezone : "";
+        $("title").textContent = tz ? `Prayer Times (${tz})` : "Prayer Times";
+
+        saveCache({
+          timings: data.timings,
+          updatedAt,
+          lat,
+          lon,
+          method: CALC_METHOD
+        });
+
+      } catch (e) {
+        // If we have cached data, we can keep showing it; just show error message.
+        showError("Couldn’t refresh (location/API). Showing cached times if available. " +
+                  "On iPhone, make sure Location is allowed for Safari.");
+        if (!cache) {
+          $("updated").textContent = "Last Updated: --";
+        }
+      }
+    }
+
+    main();
+  </script>
 </body>
 </html>
